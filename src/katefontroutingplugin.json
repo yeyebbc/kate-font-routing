@@ -1,0 +1,11 @@
+{
+    "KPlugin": {
+        "Category": "Editor",
+        "Description": "Routes Han text and emoji to preferred fallback fonts",
+        "Description[zh_CN]": "将汉字和 Emoji 路由到指定的回退字体",
+        "License": "MIT",
+        "Name": "Font Routing",
+        "Name[zh_CN]": "字体路由",
+        "Version": "1.0.0"
+    }
+}
