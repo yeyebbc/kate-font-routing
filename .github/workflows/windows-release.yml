@@ -15,8 +15,8 @@ concurrency:
 
 env:
   CRAFT_COMMIT: fc650854d5709dae65a7c06480e0ed82e820faf4
-  CRAFT_BOOTSTRAP_SHA256: e1a1be47c411ea3957478e6c287353b8853febfedf4593cc5a4b92f06e870a95
   CRAFT_BLUEPRINTS_COMMIT: 2e1e73618774b4792afc56cfcc2bd3fc1a5f264d
+  CRAFT_BOOTSTRAP_PKGCONF: "2.4.3"
   TARGET_KATE: "26.08"
   TARGET_QT: "6.11.1"
   TARGET_KF: "6.29.0"
@@ -46,7 +46,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: C:\CraftRoot\download
-          key: craft-download-${{ runner.os }}-${{ env.CRAFT_COMMIT }}-${{ env.CRAFT_BLUEPRINTS_COMMIT }}-qt${{ env.TARGET_QT }}-kf${{ env.TARGET_KF }}
+          key: craft-download-${{ runner.os }}-${{ env.CRAFT_COMMIT }}-pkgconf${{ env.CRAFT_BOOTSTRAP_PKGCONF }}-${{ env.CRAFT_BLUEPRINTS_COMMIT }}-qt${{ env.TARGET_QT }}-kf${{ env.TARGET_KF }}
 
       - name: Bootstrap pinned KDE Craft
         shell: pwsh
@@ -61,19 +61,38 @@ jobs:
           python -m pip install --disable-pip-version-check certifi
 
           New-Item -ItemType Directory -Force -Path 'C:\CraftRoot\download' | Out-Null
-          $bootstrap = 'C:\CraftRoot\download\CraftBootstrap.py'
-          Invoke-WebRequest `
-            -Uri "https://raw.githubusercontent.com/KDE/craft/$env:CRAFT_COMMIT/setup/CraftBootstrap.py" `
-            -OutFile $bootstrap
-
-          $actualHash = (Get-FileHash -LiteralPath $bootstrap -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualHash -ne $env:CRAFT_BOOTSTRAP_SHA256) {
-            throw "CraftBootstrap.py checksum mismatch: $actualHash"
+          $craftSource = Join-Path $env:RUNNER_TEMP 'craft-source'
+          git clone --filter=blob:none --no-checkout https://github.com/KDE/craft.git $craftSource
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Unable to clone KDE Craft.'
+          }
+          git -C $craftSource fetch --depth=1 origin $env:CRAFT_COMMIT
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to fetch Craft commit $env:CRAFT_COMMIT."
+          }
+          git -C $craftSource checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to check out Craft commit $env:CRAFT_COMMIT."
           }
 
-          python $bootstrap `
+          # pkgconf 2.5.1 is currently absent from the KDE binary cache and its
+          # release archive rebuild fails under bootstrap's Windows timestamps.
+          # Use the previous version already declared and hashed by this exact
+          # Craft source revision. This patch affects bootstrap tooling only.
+          $pkgconfBlueprint = Join-Path $craftSource 'blueprints\dev-utils\pkgconf\pkgconf.py'
+          $blueprintText = Get-Content -LiteralPath $pkgconfBlueprint -Raw
+          $oldTarget = 'self.defaultTarget = "2.5.1"'
+          $newTarget = "self.defaultTarget = `"$env:CRAFT_BOOTSTRAP_PKGCONF`""
+          if ([regex]::Matches($blueprintText, [regex]::Escape($oldTarget)).Count -ne 1) {
+            throw 'Unexpected pkgconf blueprint; refusing to apply the bootstrap pin.'
+          }
+          $blueprintText.Replace($oldTarget, $newTarget) |
+            Set-Content -LiteralPath $pkgconfBlueprint -Encoding utf8NoBOM
+
+          python (Join-Path $craftSource 'setup\CraftBootstrap.py') `
             --prefix 'C:\CraftRoot' `
             --branch $env:CRAFT_COMMIT `
+            --localDev $craftSource `
             --use-defaults
           if ($LASTEXITCODE -ne 0) {
             throw "Craft bootstrap failed with exit code $LASTEXITCODE."
