@@ -52,6 +52,12 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          # Git for Windows puts sh.exe on PATH on hosted runners. Craft warns
+          # that this conflicts with its own MSYS environment, so retain
+          # Git\cmd but remove the Unix-tool directories before bootstrapping.
+          $env:PATH = (($env:PATH -split ';') | Where-Object {
+            $_ -notmatch '\\Git\\(?:bin|usr\\bin)\\?$'
+          }) -join ';'
           python -m pip install --disable-pip-version-check certifi
 
           New-Item -ItemType Directory -Force -Path 'C:\CraftRoot\download' | Out-Null
@@ -69,6 +75,9 @@ jobs:
             --prefix 'C:\CraftRoot' `
             --branch $env:CRAFT_COMMIT `
             --use-defaults
+          if ($LASTEXITCODE -ne 0) {
+            throw "Craft bootstrap failed with exit code $LASTEXITCODE."
+          }
 
           git -C 'C:\CraftRoot\blueprints\craft-blueprints-kde' fetch --depth=1 origin $env:CRAFT_BLUEPRINTS_COMMIT
           if ($LASTEXITCODE -ne 0) {
