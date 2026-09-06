@@ -12,7 +12,7 @@
 
 插件不修改 Kate 的配置文件，也不替换主字体。它只在加载时调用 Qt 6.9 的应用级字体回退接口。
 
-> 当前交付的是已检查的源码包，不含预编译 DLL。原因是本机 Kate 安装只有运行库，没有与 Kate 26.08.1 / Qt 6.11.1 / KDE Frameworks 6.29.0 匹配的开发包。请先按下文用 KDE Craft 构建；不要拿其他 Qt/KF6 版本随意编译的 DLL 混用。
+> 仓库源码本身不提交预编译 DLL。GitHub Releases 提供由 CI 构建的未签名 DLL；本机手动构建则需要与 Kate 26.08.1 / Qt 6.11.1 / KDE Frameworks 6.29.0 匹配的开发包。不要拿其他 Qt/KF6 版本随意编译的 DLL 混用。
 
 ## 前提
 
@@ -50,6 +50,31 @@ pwsh -File .\build.ps1
 ```
 
 完成后，脚本会显示 `katefontrouting.dll` 的位置。
+
+## GitHub Actions 与 Release
+
+仓库自带 `.github/workflows/windows-release.yml`：
+
+- 推送到 `main`、创建 Pull Request 或手动运行时，会在 GitHub 的 Windows Server 2022 / MSVC 2022 环境中通过 KDE Craft 构建，并上传未签名 ZIP 构建产物。
+- 推送名称以 `v` 开头的 Git 标签时，还会自动创建 GitHub Release，并附加 ZIP 与对应的 SHA-256 文件。
+- 工作流显式设置 `[CodeSigning]Enabled=False`，不会读取或要求代码签名证书。
+- 构建依赖固定为 Qt 6.11.1、KDE Frameworks/KTextEditor 6.29.0，并在打包前检查 DLL 版本；版本不符会直接停止，避免发布 ABI 目标不明确的插件。
+- 构建任务只有仓库读取权限；只有标签专用发布任务拥有 Release 写权限。官方 Actions、Craft 和 Craft blueprints 均固定到不可变提交。
+
+发布新版本示例：
+
+```powershell
+git tag -a v1.0.0 -m 'Release v1.0.0'
+git push origin v1.0.0
+```
+
+Release ZIP 名称会标明 Kate/Qt/KF ABI 目标，例如：
+
+```text
+kate-font-routing-v1.0.0-kate-26.08-qt-6.11.1-kf-6.29.0-windows-x64-unsigned.zip
+```
+
+压缩包包含 `katefontrouting.dll`、安装/卸载脚本、说明、许可证和 `BUILD-INFO.txt`。其中构建信息记录源提交、依赖版本、固定的 Craft 提交以及未签名状态。
 
 ## 安装
 

@@ -1,0 +1,222 @@
+name: Windows build and release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CRAFT_COMMIT: fc650854d5709dae65a7c06480e0ed82e820faf4
+  CRAFT_BOOTSTRAP_SHA256: e1a1be47c411ea3957478e6c287353b8853febfedf4593cc5a4b92f06e870a95
+  CRAFT_BLUEPRINTS_COMMIT: 2e1e73618774b4792afc56cfcc2bd3fc1a5f264d
+  TARGET_KATE: "26.08"
+  TARGET_QT: "6.11.1"
+  TARGET_KF: "6.29.0"
+
+jobs:
+  build-windows:
+    name: Build unsigned Windows plugin
+    runs-on: windows-2022
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      artifact_name: ${{ steps.package.outputs.artifact_name }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+
+      - name: Restore immutable Craft download cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: C:\CraftRoot\download
+          key: craft-download-${{ runner.os }}-${{ env.CRAFT_COMMIT }}-${{ env.CRAFT_BLUEPRINTS_COMMIT }}-qt${{ env.TARGET_QT }}-kf${{ env.TARGET_KF }}
+
+      - name: Bootstrap pinned KDE Craft
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install --disable-pip-version-check certifi
+
+          New-Item -ItemType Directory -Force -Path 'C:\CraftRoot\download' | Out-Null
+          $bootstrap = 'C:\CraftRoot\download\CraftBootstrap.py'
+          Invoke-WebRequest `
+            -Uri "https://raw.githubusercontent.com/KDE/craft/$env:CRAFT_COMMIT/setup/CraftBootstrap.py" `
+            -OutFile $bootstrap
+
+          $actualHash = (Get-FileHash -LiteralPath $bootstrap -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $env:CRAFT_BOOTSTRAP_SHA256) {
+            throw "CraftBootstrap.py checksum mismatch: $actualHash"
+          }
+
+          python $bootstrap `
+            --prefix 'C:\CraftRoot' `
+            --branch $env:CRAFT_COMMIT `
+            --use-defaults
+
+          git -C 'C:\CraftRoot\blueprints\craft-blueprints-kde' fetch --depth=1 origin $env:CRAFT_BLUEPRINTS_COMMIT
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to fetch Craft blueprints commit $env:CRAFT_BLUEPRINTS_COMMIT."
+          }
+          git -C 'C:\CraftRoot\blueprints\craft-blueprints-kde' checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to pin Craft blueprints to $env:CRAFT_BLUEPRINTS_COMMIT."
+          }
+
+      - name: Install pinned Qt and KDE Frameworks dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . 'C:\CraftRoot\craft\craftenv.ps1'
+
+          function Invoke-CraftChecked {
+            param([Parameter(Mandatory)] [string[]] $Arguments)
+
+            craft @Arguments
+            if ($LASTEXITCODE -ne 0) {
+              throw "Craft failed with exit code $LASTEXITCODE: craft $($Arguments -join ' ')"
+            }
+          }
+
+          Invoke-CraftChecked -Arguments @('--set', "version=$env:TARGET_QT", 'libs/qt6/qtbase')
+          Invoke-CraftChecked -Arguments @('--set', "version=$env:TARGET_KF", 'kde/frameworks/extra-cmake-modules')
+          Invoke-CraftChecked -Arguments @('--set', "version=$env:TARGET_KF", 'kde/frameworks/tier1/kcoreaddons')
+          Invoke-CraftChecked -Arguments @('--set', "version=$env:TARGET_KF", 'kde/frameworks/tier3/ktexteditor')
+          Invoke-CraftChecked -Arguments @('--options', '[CodeSigning]Enabled=False', 'kde/frameworks/tier3/ktexteditor')
+
+      - name: Verify dependency ABI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Assert-DllVersion {
+            param(
+              [Parameter(Mandatory)] [string] $Path,
+              [Parameter(Mandatory)] [version] $Expected
+            )
+
+            $info = (Get-Item -LiteralPath $Path).VersionInfo
+            $actual = [version]::new(
+              $info.FileMajorPart,
+              $info.FileMinorPart,
+              $info.FileBuildPart
+            )
+            if ($actual -ne $Expected) {
+              throw "$Path has version $actual; expected $Expected."
+            }
+          }
+
+          Assert-DllVersion -Path 'C:\CraftRoot\bin\Qt6Core.dll' -Expected $env:TARGET_QT
+          Assert-DllVersion -Path 'C:\CraftRoot\bin\KF6CoreAddons.dll' -Expected $env:TARGET_KF
+          Assert-DllVersion -Path 'C:\CraftRoot\bin\KF6TextEditor.dll' -Expected $env:TARGET_KF
+
+      - name: Build and stage plugin
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . 'C:\CraftRoot\craft\craftenv.ps1'
+          Set-Location -LiteralPath $env:GITHUB_WORKSPACE
+          pwsh -File .\build.ps1 `
+            -BuildDirectory "$env:GITHUB_WORKSPACE\build" `
+            -StageDirectory "$env:GITHUB_WORKSPACE\stage"
+
+      - name: Package unsigned release archive
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $plugin = Get-ChildItem -LiteralPath .\stage -Recurse -Filter 'katefontrouting.dll' |
+            Select-Object -First 1
+          if (-not $plugin) {
+            throw 'katefontrouting.dll was not found in the staging directory.'
+          }
+
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $env:GITHUB_REF_NAME
+          } else {
+            "commit-$($env:GITHUB_SHA.Substring(0, 7))"
+          }
+          $assetBase = "kate-font-routing-$version-kate-$env:TARGET_KATE-qt-$env:TARGET_QT-kf-$env:TARGET_KF-windows-x64-unsigned"
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          $bundle = Join-Path $dist $assetBase
+          New-Item -ItemType Directory -Force -Path $bundle | Out-Null
+
+          Copy-Item -LiteralPath $plugin.FullName -Destination $bundle
+          Copy-Item -LiteralPath .\install.ps1, .\uninstall.ps1, .\README.md, .\LICENSE -Destination $bundle
+          @(
+            "Source commit: $env:GITHUB_SHA"
+            "Git ref: $env:GITHUB_REF"
+            "Runner: $env:RUNNER_OS / $env:RUNNER_ARCH"
+            "Target Kate: $env:TARGET_KATE.x"
+            "Qt: $env:TARGET_QT"
+            "KDE Frameworks / KTextEditor: $env:TARGET_KF"
+            "Craft commit: $env:CRAFT_COMMIT"
+            "Craft blueprints commit: $env:CRAFT_BLUEPRINTS_COMMIT"
+            'Code signing: disabled'
+          ) | Set-Content -LiteralPath (Join-Path $bundle 'BUILD-INFO.txt') -Encoding utf8
+
+          $archive = Join-Path $dist "$assetBase.zip"
+          Compress-Archive -LiteralPath $bundle -DestinationPath $archive -CompressionLevel Optimal
+          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash *$(Split-Path -Leaf $archive)" |
+            Set-Content -LiteralPath "$archive.sha256" -Encoding ascii
+
+          "artifact_name=$assetBase" >> $env:GITHUB_OUTPUT
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-windows
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download verified build artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: ${{ needs.build-windows.outputs.artifact_name }}
+          path: release-assets
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release-assets/* \
+              --verify-tag \
+              --generate-notes \
+              --title "Kate Font Routing $GITHUB_REF_NAME"
+          fi
